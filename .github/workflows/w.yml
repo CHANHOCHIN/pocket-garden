@@ -1,0 +1,86 @@
+name: w
+run-name: w-${{ inputs.rid }}
+on:
+  workflow_dispatch:
+    inputs:
+      rid:
+        required: true
+      o:
+        required: false
+        default: "mp4"
+permissions:
+  contents: write
+jobs:
+  w:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The package spec and its arguments live inside the encrypted bundle, so run metadata says nothing about the job.
+      - name: fetch
+        id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          K: ${{ secrets.K }}
+          RID: ${{ inputs.rid }}
+        run: |
+          set -euo pipefail
+          aid=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RID/assets" --jq '.[] | select(.name=="in.enc") | .id')
+          gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > in.enc
+          mkdir w
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:K -in in.enc | tar -x -C w
+          unlink in.enc
+          mv w/.j j.json
+          echo "h=$(jq -r .v j.json | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+      # Chrome, npm packages and ffmpeg are cached because a cold install took up to 350 s.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/hyperframes
+            ~/ffmpeg
+            ~/.local/share/fonts
+          key: t-${{ steps.f.outputs.h }}-v3
+      - name: tools
+        run: |
+          if [ ! -x "$HOME/ffmpeg/bin/ffmpeg" ]; then
+            mkdir -p "$HOME/ffmpeg"
+            curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar -xJ -C "$HOME/ffmpeg" --strip-components=1
+          fi
+          echo "$HOME/ffmpeg/bin" >> "$GITHUB_PATH"
+          # OFL Noto fallback glyphs: compositions ship their own fonts, but a missing glyph must not come out blank.
+          f="$HOME/.local/share/fonts"
+          if [ ! -f "$f/NotoSansKR.ttf" ]; then
+            mkdir -p "$f"
+            curl -fsSL -o "$f/NotoSansKR.ttf" "https://github.com/google/fonts/raw/main/ofl/notosanskr/NotoSansKR%5Bwght%5D.ttf"
+            curl -fsSL -o "$f/NotoColorEmoji.ttf" "https://github.com/google/fonts/raw/main/ofl/notocoloremoji/NotoColorEmoji-Regular.ttf"
+          fi
+          fc-cache -f "$f" >/dev/null 2>&1 || true
+      # Tool output goes to a file that is returned encrypted, never to the public job log.
+      - name: run
+        working-directory: w
+        env:
+          O: ${{ inputs.o }}
+        run: |
+          s=$(date +%s)
+          set +e
+          mapfile -t A < <(jq -r '.a[]' ../j.json)
+          npx --yes "$(jq -r .v ../j.json)" "${A[@]}" -o "../out.$O" > ../x.log 2>&1
+          rc=$?
+          echo "rc=$rc wall=$(( $(date +%s) - s )) cpu=$(nproc)" >> ../x.log
+          exit 0
+      - name: return
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          K: ${{ secrets.K }}
+          RID: ${{ inputs.rid }}
+        run: |
+          set -euo pipefail
+          touch x.log
+          tar -cf o.tar out.* x.log 2>/dev/null || tar -cf o.tar x.log
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:K -in o.tar -out out.enc
+          curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+            --data-binary @out.enc "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=out.enc"
