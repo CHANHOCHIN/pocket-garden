@@ -1,0 +1,68 @@
+name: b
+run-name: b-${{ inputs.rid }}-${{ inputs.n }}
+on:
+  workflow_dispatch:
+    inputs:
+      rid:
+        required: true
+      n:
+        required: true
+permissions:
+  contents: write
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      # One shared encrypted bundle per release; each run takes piece n of the list inside it.
+      - name: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          K: ${{ secrets.K }}
+          RID: ${{ inputs.rid }}
+        run: |
+          set -euo pipefail
+          aid=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RID/assets" --jq '.[] | select(.name=="in.enc") | .id')
+          gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > in.enc
+          mkdir w
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:K -in in.enc | tar -x -C w
+          unlink in.enc
+      - uses: actions/cache@v4
+        with:
+          path: ~/t
+          key: t-5.2.3-v1
+      - name: tools
+        run: |
+          if [ ! -x "$HOME/t/b/blender" ]; then
+            mkdir -p "$HOME/t/b"
+            curl -fsSL https://download.blender.org/release/Blender5.2/blender-5.2.3-linux-x64.tar.xz | tar -xJ -C "$HOME/t/b" --strip-components=1
+          fi
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo apt-get install -y -qq xvfb libegl1 libgl1-mesa-dri libglx-mesa0 libxkbcommon0 libxi6 libxrender1 libsm6 libxxf86vm1 libxfixes3 libvulkan1 mesa-vulkan-drivers >/dev/null 2>&1 || true
+      # Output goes to a file that is returned encrypted, never to the public job log.
+      - name: run
+        working-directory: w
+        env:
+          N: ${{ inputs.n }}
+        run: |
+          s=$(date +%s)
+          set +e
+          xvfb-run -a -s "-screen 0 1920x1080x24" "$HOME/t/b/blender" -b "$(cat .f)" -P .p -- "$N" > ../x.log 2>&1
+          rc=$?
+          echo "rc=$rc wall=$(( $(date +%s) - s )) cpu=$(nproc)" >> ../x.log
+          mv o.mp4 ../out-$N.mp4 2>/dev/null || true
+          exit 0
+      - name: return
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          K: ${{ secrets.K }}
+          RID: ${{ inputs.rid }}
+          N: ${{ inputs.n }}
+        run: |
+          set -euo pipefail
+          touch x.log
+          tar -cf o.tar out-*.mp4 x.log 2>/dev/null || tar -cf o.tar x.log
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:K -in o.tar -out out.enc
+          curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+            --data-binary @out.enc "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=o$N.enc"
